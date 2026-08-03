@@ -171,13 +171,36 @@ DEFAULTS = {
 }
 
 
-def load_env():
-    """Load environment variables from ~/.applypilot/.env if it exists."""
+def load_env(enforce_expiry: bool = True):
+    """Load environment variables from ~/.applypilot/.env if it exists.
+
+    Managed API keys are expired here (see keyexpiry) so that every entry
+    point picks up the check without having to opt in. Pass
+    enforce_expiry=False to inspect the raw environment without scrubbing.
+    """
     from dotenv import load_dotenv
     if ENV_PATH.exists():
         load_dotenv(ENV_PATH)
     # Also try CWD .env as fallback
     load_dotenv()
+
+    if not enforce_expiry:
+        return []
+
+    from . import keyexpiry
+    expired = keyexpiry.enforce()
+    if expired:
+        from rich.console import Console
+        console = Console(stderr=True)
+        names = ", ".join(expired)
+        console.print(
+            f"\n[bold yellow]API key expired:[/bold yellow] {names} "
+            f"passed the {keyexpiry.ttl_days()}-day limit and has been deleted "
+            f"from {ENV_PATH}.\n"
+            "[dim]Issue a fresh key, then run [bold]applypilot key set[/bold] "
+            "(or [bold]applypilot init[/bold]) to configure it.[/dim]\n"
+        )
+    return expired
 
 
 # ---------------------------------------------------------------------------

@@ -106,13 +106,34 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
         if r.lower() in loc:
             return False
 
+    # An empty accept list means "no location restriction", not "reject
+    # everything". Treating it as an allowlist silently discarded every
+    # on-site job for users who never defined location_accept.
+    if not accept:
+        return True
+
     # Accept matches
     for a in accept:
         if a.lower() in loc:
             return True
 
-    # No match -- reject unknown
+    # Allowlist configured and nothing matched
     return False
+
+
+def _clean_str(value) -> str | None:
+    """Normalise a scraped cell to a real string or None.
+
+    pandas/jobspy hand back NaN, None, or the strings "nan"/"None"
+    interchangeably. str() on any of them yields a TRUTHY string, which
+    silently defeats every `x or fallback` downstream.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.lower() in ("", "nan", "none", "null", "<na>"):
+        return None
+    return text
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
@@ -128,16 +149,16 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         if not url or url == "nan":
             continue
 
-        title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
-        company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
-        location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
+        title = _clean_str(row.get("title"))
+        company = _clean_str(row.get("company"))
+        location_str = _clean_str(row.get("location"))
 
         # Build salary string from min/max
         salary = None
         min_amt = row.get("min_amount")
         max_amt = row.get("max_amount")
-        interval = str(row.get("interval", "")) if str(row.get("interval", "")) != "nan" else ""
-        currency = str(row.get("currency", "")) if str(row.get("currency", "")) != "nan" else ""
+        interval = _clean_str(row.get("interval")) or ""
+        currency = _clean_str(row.get("currency")) or ""
         if min_amt and str(min_amt) != "nan":
             if max_amt and str(max_amt) != "nan":
                 salary = f"{currency}{int(float(min_amt)):,}-{currency}{int(float(max_amt)):,}"
@@ -146,7 +167,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             if interval:
                 salary += f"/{interval}"
 
-        description = str(row.get("description", "")) if str(row.get("description", "")) != "nan" else None
+        description = _clean_str(row.get("description"))
         site_name = str(row.get("site", source_label))
         is_remote = row.get("is_remote", False)
 
@@ -163,15 +184,19 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             full_description = description
             detail_scraped_at = now
 
-        # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        # Extract apply URL if JobSpy provided it.
+        # str(None) is the four-character string "None", which passes a
+        # != "nan" check and is TRUTHY — so `application_url or url` fallbacks
+        # downstream resolved to the literal string "None" and the apply agent
+        # was told to navigate to a URL called "None". Normalise properly.
+        apply_url = _clean_str(row.get("job_url_direct"))
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
                 "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, company, salary, description, location_str, site_label, strategy, now,
                  full_description, apply_url, detail_scraped_at),
             )
             new += 1
@@ -355,6 +380,29 @@ def search_jobs(
     return {"total": total, "new": new, "existing": existing}
 
 
+def _filter_locations(locs: list[dict], wanted: list[str]) -> list[dict]:
+    """Narrow configured locations to those the user asked for.
+
+    Matches case-insensitively against a location's `label` or its
+    `location` string, in either direction — so "Dubai" selects the entry
+    "Dubai, United Arab Emirates", and "Dubai, United Arab Emirates"
+    selects an entry labelled "dubai".
+    """
+    targets = [w.strip().lower() for w in wanted if w and w.strip()]
+    if not targets:
+        return locs
+
+    selected = []
+    for loc in locs:
+        candidates = [str(loc.get("label", "")).lower(),
+                      str(loc.get("location", "")).lower()]
+        for target in targets:
+            if any(c and (target in c or c in target) for c in candidates):
+                selected.append(loc)
+                break
+    return selected
+
+
 # -- Full crawl (all queries x all locations) --------------------------------
 
 def _full_crawl(
@@ -381,7 +429,15 @@ def _full_crawl(
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
     if locations:
-        locs = [loc for loc in locs if loc.get("label") in locations]
+        locs = _filter_locations(locs, locations)
+        if not locs:
+            log.warning(
+                "No configured location matched %s. Available: %s",
+                locations,
+                ", ".join(l.get("label") or l.get("location", "") for l in
+                          search_cfg.get("locations", [])),
+            )
+            return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
     searches = []
     for q in queries:
@@ -440,7 +496,8 @@ def _full_crawl(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_discovery(cfg: dict | None = None) -> dict:
+def run_discovery(cfg: dict | None = None,
+                  locations: list[str] | None = None) -> dict:
     """Main entry point for JobSpy-based job discovery.
 
     Loads search queries and locations from the user's search config YAML,
@@ -465,7 +522,8 @@ def run_discovery(cfg: dict | None = None) -> dict:
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
     hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")
-    locations = cfg.get("location_labels")
+    if locations is None:
+        locations = cfg.get("location_labels")
 
     return _full_crawl(
         search_cfg=cfg,

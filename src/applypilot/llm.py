@@ -53,6 +53,7 @@ def _detect_provider() -> tuple[str, str, str]:
             os.environ.get("LLM_API_KEY", ""),
         )
 
+
     raise RuntimeError(
         "No LLM provider configured. "
         "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
@@ -64,7 +65,33 @@ def _detect_provider() -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 _MAX_RETRIES = 5
-_TIMEOUT = 120  # seconds
+
+
+def _timeout_seconds() -> float:
+    """Request timeout. Raise LLM_TIMEOUT for slow local models."""
+    try:
+        value = float(os.environ.get("LLM_TIMEOUT", "120"))
+        return value if value > 0 else 120.0
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _min_output_tokens() -> int:
+    """Floor for max_tokens, for reasoning models.
+
+    Models that emit chain-of-thought before their answer (Qwen3 "thinking",
+    gpt-oss reasoning modes, DeepSeek-R1 distills) spend the budget on
+    reasoning first. The pipeline asks for as few as 512 tokens on the
+    scoring stage, which such a model consumes entirely — returning an
+    empty string rather than an error, so the stage fails silently.
+
+    Set LLM_MIN_OUTPUT_TOKENS to raise the floor for every request.
+    """
+    try:
+        value = int(os.environ.get("LLM_MIN_OUTPUT_TOKENS", "0"))
+        return max(value, 0)
+    except (TypeError, ValueError):
+        return 0
 
 # Base wait on first 429/503 (doubles each retry, caps at 60s).
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
@@ -84,14 +111,37 @@ class LLMClient:
     for the lifetime of the process.
     """
 
-    def __init__(self, base_url: str, model: str, api_key: str) -> None:
+    def __init__(self, base_url: str, model: str, api_key: str,
+                 fallback: tuple[str, str, str] | None = None) -> None:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        self._client = httpx.Client(timeout=_timeout_seconds())
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        # (base_url, model, api_key) to switch to if this endpoint is
+        # unreachable. Used for local -> cloud failover.
+        self._fallback = fallback
+        self._failed_over = False
+
+    def _activate_fallback(self, reason: str) -> bool:
+        """Switch permanently to the fallback provider. False if none left."""
+        if not self._fallback or self._failed_over:
+            return False
+        base_url, model, api_key = self._fallback
+        log.warning(
+            "LLM endpoint %s unreachable (%s). Falling back to %s (model: %s) "
+            "for the rest of this run.",
+            self.base_url, reason, base_url, model,
+        )
+        self.base_url = base_url
+        self.model = model
+        self.api_key = api_key
+        self._is_gemini = base_url.startswith(_GEMINI_COMPAT_BASE)
+        self._use_native_gemini = False
+        self._failed_over = True
+        return True
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -181,7 +231,35 @@ class LLMClient:
     def _handle_compat_response(resp: httpx.Response) -> str:
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"].get("content") or ""
+
+        # Reasoning models served by LM Studio / vLLM return their chain of
+        # thought in `reasoning_content` and leave `content` empty when the
+        # token budget runs out mid-thought. Silently returning "" makes every
+        # downstream stage look like a parse failure, so name the real cause.
+        if not content.strip():
+            reasoning = choice["message"].get("reasoning_content") or ""
+            usage = data.get("usage", {}) or {}
+            detail = (usage.get("completion_tokens_details") or {})
+            if reasoning and choice.get("finish_reason") == "length":
+                raise _ReasoningBudgetExhausted(
+                    f"Model spent its entire {usage.get('completion_tokens', '?')}-token "
+                    f"budget on reasoning ({detail.get('reasoning_tokens', '?')} reasoning "
+                    f"tokens) and produced no answer. Raise max_tokens, or use a "
+                    f"non-reasoning model for this stage."
+                )
+        return content
+
+    def _apply_model_tweaks(self, messages: list[dict]) -> list[dict]:
+        """Model-specific prompt adjustments for the currently active model."""
+        # Qwen3: /no_think skips chain-of-thought on structured extraction.
+        if "qwen" in self.model.lower() and messages:
+            first = messages[0]
+            content = first.get("content", "")
+            if first.get("role") == "user" and not content.startswith("/no_think"):
+                return [{**first, "content": f"/no_think\n{content}"}] + messages[1:]
+        return messages
 
     # -- public API ---------------------------------------------------------
 
@@ -192,14 +270,16 @@ class LLMClient:
         max_tokens: int = 4096,
     ) -> str:
         """Send a chat completion request and return the assistant message text."""
-        # Qwen3 optimization: prepend /no_think to skip chain-of-thought
-        # reasoning, saving tokens on structured extraction tasks.
-        if "qwen" in self.model.lower() and messages:
-            first = messages[0]
-            if first.get("role") == "user" and not first["content"].startswith("/no_think"):
-                messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
+        # Reasoning models burn the budget on thinking before they answer.
+        # Without a floor they return "" instead of failing loudly.
+        max_tokens = max(max_tokens, _min_output_tokens())
+
+        original = messages
 
         for attempt in range(_MAX_RETRIES):
+            # Recomputed each attempt: after a failover the model changes, and
+            # /no_think is meaningless to anything but Qwen.
+            messages = self._apply_model_tweaks(original)
             try:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
@@ -226,8 +306,32 @@ class LLMClient:
                         f"{native_exc.response.text[:200]}"
                     ) from native_exc
 
+            except _ReasoningBudgetExhausted as exc:
+                if self._activate_fallback("reasoning budget exhausted"):
+                    continue
+                raise RuntimeError(
+                    f"{self.model}: {exc} "
+                    f"(set LLM_FALLBACK_URL or a cloud key to fail over automatically)"
+                ) from exc
+
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError) as exc:
+                # Local server down / not started. Fail over to the cloud
+                # provider if one is configured, otherwise report clearly.
+                if self._activate_fallback(type(exc).__name__):
+                    continue
+                raise RuntimeError(
+                    f"Cannot reach LLM endpoint {self.base_url} ({type(exc).__name__}). "
+                    "If this is LM Studio, check the server is started and the URL "
+                    "ends in /v1. Set GEMINI_API_KEY to fail over automatically."
+                ) from exc
+
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
+                # A local server that is up but has no model loaded returns
+                # 404/400 rather than refusing the connection.
+                if resp.status_code in (400, 404) and not self._is_gemini:
+                    if self._activate_fallback(f"HTTP {resp.status_code}"):
+                        continue
                 if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
@@ -241,6 +345,13 @@ class LLMClient:
                             wait = _RATE_LIMIT_BASE_WAIT * (2 ** attempt)
                     else:
                         wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+
+                    # Quota exhausted (not just per-minute throttling) — no
+                    # amount of waiting helps, so switch providers now.
+                    body = (resp.text or "").lower()
+                    if ("quota" in body or "billing" in body) and self._fallback:
+                        if self._activate_fallback(f"HTTP {resp.status_code} quota exhausted"):
+                            continue
 
                     log.warning(
                         "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
@@ -273,6 +384,10 @@ class LLMClient:
         self._client.close()
 
 
+class _ReasoningBudgetExhausted(Exception):
+    """Model produced only chain-of-thought and no answer within max_tokens."""
+
+
 class _GeminiCompatForbidden(Exception):
     """Sentinel: Gemini OpenAI-compat returned 403. Switch to native API."""
     def __init__(self, response: httpx.Response) -> None:
@@ -287,11 +402,54 @@ class _GeminiCompatForbidden(Exception):
 _instance: LLMClient | None = None
 
 
+def _detect_fallback(active_base_url: str) -> tuple[str, str, str] | None:
+    """Provider to fail over to when the active one becomes unusable.
+
+    Works in both directions:
+      cloud primary -> local, when quota is exhausted or the API is down
+      local primary -> cloud, when the local server is unreachable
+
+    Cloud->local uses LLM_FALLBACK_URL (and LLM_FALLBACK_MODEL). Local->cloud
+    uses whichever API key is configured.
+    """
+    is_cloud = active_base_url.startswith(
+        ("https://generativelanguage.googleapis.com", "https://api.openai.com")
+    )
+
+    if is_cloud:
+        # Fail over to a local endpoint if one is declared.
+        fallback_url = os.environ.get("LLM_FALLBACK_URL", "")
+        if fallback_url:
+            return (fallback_url.rstrip("/"),
+                    os.environ.get("LLM_FALLBACK_MODEL", "local-model"),
+                    os.environ.get("LLM_API_KEY", ""))
+        return None
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key:
+        return (_GEMINI_COMPAT_BASE,
+                os.environ.get("LLM_FALLBACK_MODEL", "gemini-flash-latest"),
+                gemini_key)
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if openai_key:
+        return ("https://api.openai.com/v1",
+                os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"),
+                openai_key)
+
+    return None
+
+
 def get_client() -> LLMClient:
     """Return (or create) the module-level LLMClient singleton."""
     global _instance
     if _instance is None:
         base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+        fallback = _detect_fallback(base_url)
+        if fallback:
+            log.info("LLM provider: %s  model: %s  (fallback: %s)",
+                     base_url, model, fallback[1])
+        else:
+            log.info("LLM provider: %s  model: %s", base_url, model)
+        _instance = LLMClient(base_url, model, api_key, fallback=fallback)
     return _instance

@@ -55,15 +55,18 @@ def _build_profile_summary(profile: dict) -> str:
     if personal.get("website_url"):
         lines.append(f"Website: {personal['website_url']}")
 
-    # Work authorization
-    lines.append(f"Work Auth: {work_auth.get('legally_authorized_to_work', 'See profile')}")
-    lines.append(f"Sponsorship Needed: {work_auth.get('require_sponsorship', 'See profile')}")
+    # Work authorization — country-dependent, so state the rule not a boolean.
+    lines.append(f"Work Auth: {_sponsorship_line(p)}")
     if work_auth.get("work_permit_type"):
         lines.append(f"Work Permit: {work_auth['work_permit_type']}")
 
-    # Compensation
-    currency = comp.get("salary_currency", "USD")
-    lines.append(f"Salary Expectation: ${comp['salary_expectation']} {currency}")
+    # Relocation
+    lines.append(f"Relocation: {_relocation_line(p, personal.get('city', 'home city'))}")
+
+    # Compensation — the figure is market-dependent, so defer to the SALARY
+    # section rather than asserting one number with a hardcoded dollar sign.
+    lines.append("Salary Expectation: see the SALARY section — it is set per market "
+                 "for this job's country. Do not use a figure from anywhere else.")
 
     # Experience
     if exp.get("years_of_experience_total"):
@@ -109,6 +112,29 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
     else:
         city_list = primary_city
 
+    reloc = profile.get("relocation", {}) or {}
+    willing = bool(reloc.get("willing_to_relocate"))
+    targets = reloc.get("target_locations") or []
+
+    if willing and targets:
+        target_list = ", ".join(targets)
+        return f"""== LOCATION CHECK (do this FIRST before any form) ==
+This candidate IS WILLING TO RELOCATE and is actively targeting: {target_list}.
+Relocation is the whole point of these applications — do not reject a role for
+being onsite in a target location.
+
+Read the job page. Determine the work arrangement. Then decide:
+- "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
+- Onsite or hybrid in any of {target_list} -> ELIGIBLE. Apply. The candidate will relocate.
+- Onsite or hybrid in {city_list} (home city) -> ELIGIBLE. Apply.
+- Onsite in a location NOT in the target list and NOT remote -> NOT ELIGIBLE.
+  Output RESULT:FAILED:not_eligible_location
+- Cannot determine location -> Continue applying.
+
+Do NOT reject a target-location role over work authorization or visas. Needing
+sponsorship is normal for these markets; the employer decides. Answer any
+sponsorship question truthfully (see SCREENING) and continue."""
+
     return f"""== LOCATION CHECK (do this FIRST before any form) ==
 Read the job page. Determine the work arrangement. Then decide:
 - "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
@@ -120,46 +146,177 @@ Read the job page. Determine the work arrangement. Then decide:
 Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
 
 
-def _build_salary_section(profile: dict) -> str:
-    """Build the salary negotiation instructions.
+def resolve_region(comp: dict, location: str) -> tuple[str, dict]:
+    """Pick the compensation band matching a job's location.
 
-    Adapts floor, range, and currency from the profile's compensation section.
+    Salary expectations don't convert across markets — the going rate for a
+    role in Dubai is not the INR figure at spot FX. `by_region` lets the
+    profile carry a separate band per market; each entry lists the location
+    substrings that select it.
+
+    Returns (region_name, band). Falls back to the top-level figures when
+    nothing matches, so profiles without by_region behave as before.
     """
+    default = {
+        "currency": comp.get("salary_currency", "USD"),
+        "expectation": comp.get("salary_expectation", ""),
+        "min": comp.get("salary_range_min", comp.get("salary_expectation", "")),
+        "max": comp.get("salary_range_max", comp.get("salary_expectation", "")),
+    }
+
+    by_region = comp.get("by_region") or {}
+    if not by_region:
+        return ("default", default)
+
+    haystack = (location or "").lower()
+    for name, band in by_region.items():
+        if not isinstance(band, dict):
+            continue
+        for token in band.get("match", []):
+            if str(token).lower() in haystack:
+                merged = dict(default)
+                merged.update({k: v for k, v in band.items() if k != "match"})
+                return (name, merged)
+
+    fallback_name = comp.get("default_region", "")
+    fallback = by_region.get(fallback_name)
+    if isinstance(fallback, dict):
+        merged = dict(default)
+        merged.update({k: v for k, v in fallback.items() if k != "match"})
+        return (fallback_name, merged)
+
+    return ("default", default)
+
+
+def _fmt_money(amount, currency: str) -> str:
+    """Format an amount with its currency, without assuming dollars."""
+    text = str(amount)
+    return f"{text} {currency}".strip()
+
+
+def _build_salary_section(profile: dict, location: str = "") -> str:
+    """Build the salary negotiation instructions for a job's market."""
     comp = profile["compensation"]
-    currency = comp.get("salary_currency", "USD")
-    floor = comp["salary_expectation"]
-    range_min = comp.get("salary_range_min", floor)
-    range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
+    region, band = resolve_region(comp, location)
+
+    currency = band["currency"]
+    floor = str(band["expectation"])
+    range_min = str(band.get("min") or floor)
+    range_max = str(band.get("max") or floor)
     conversion_note = comp.get("currency_conversion_note", "")
 
-    # Compute example hourly rates at 3 salary levels
+    # Senior-title uplift as a percentage, so it works in any currency.
+    try:
+        premium_pct = int(comp.get("senior_premium_pct", 15))
+    except (TypeError, ValueError):
+        premium_pct = 15
+    try:
+        senior_floor = _fmt_money(int(round(int(floor) * (1 + premium_pct / 100))), currency)
+    except (TypeError, ValueError):
+        senior_floor = f"{premium_pct}% above the floor"
+
+    # Hourly equivalents at three levels, in the local currency.
     try:
         floor_int = int(floor)
-        examples = [
-            (f"${floor_int // 1000}K", floor_int // 2080),
-            (f"${(floor_int + 25000) // 1000}K", (floor_int + 25000) // 2080),
-            (f"${(floor_int + 55000) // 1000}K", (floor_int + 55000) // 2080),
-        ]
-        hourly_line = ", ".join(f"{sal} = ${hr}/hr" for sal, hr in examples)
+        # Never illustrate a figure above the stated ceiling — these examples
+        # end up quoted verbatim.
+        ceiling = max(int(range_max), floor_int) if str(range_max).isdigit() else floor_int
+        steps = sorted({floor_int,
+                        min(int(floor_int * 1.15), ceiling),
+                        min(int(floor_int * 1.30), ceiling)})
+        hourly_line = ", ".join(
+            f"{_fmt_money(s, currency)} = {_fmt_money(s // 2080, currency)}/hr" for s in steps
+        )
     except (ValueError, TypeError):
         hourly_line = "Divide annual salary by 2080"
 
-    # Currency conversion guidance
+    # Monthly-quoting markets (UAE, Saudi, much of Asia) ask for a monthly
+    # figure. Answering with the annual number is a 12x overshoot.
+    def _monthly(annual, explicit):
+        if explicit:
+            return str(explicit)
+        try:
+            return str(int(round(int(annual) / 12)))
+        except (TypeError, ValueError):
+            return ""
+
+    m_min = _monthly(range_min, band.get("monthly_min"))
+    m_max = _monthly(range_max, band.get("monthly_max"))
+    m_floor = _monthly(floor, band.get("monthly_min"))
+
+    if band.get("quote_monthly") and m_floor:
+        monthly_line = (
+            f"\nIMPORTANT — this market normally quotes MONTHLY salary. If the field says "
+            f"monthly, per month, or /mo, answer {_fmt_money(m_min, currency)} to "
+            f"{_fmt_money(m_max, currency)} — NEVER the annual figure. If it says annual, "
+            f"per annum, or yearly, use {_fmt_money(floor, currency)} to "
+            f"{_fmt_money(range_max, currency)}. If the period is not stated, ask for "
+            f"monthly: {_fmt_money(m_floor, currency)}. Check the field label before typing."
+        )
+    elif m_floor:
+        monthly_line = (f"\nAsked for a MONTHLY figure? -> {_fmt_money(m_min, currency)} to "
+                        f"{_fmt_money(m_max, currency)} (annual / 12).")
+    else:
+        monthly_line = ""
+
     if conversion_note:
         convert_line = f"Posting is in a different currency? -> {conversion_note}"
     else:
-        convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
+        convert_line = ("Posting is in a different currency? -> Target the midpoint of their "
+                        "posted range in THAT currency. Do not convert your home figure at "
+                        "spot FX -- quote the local market rate.")
+
+    region_line = (f"Market for this job: {region}. Use the figures below as-is; "
+                   f"they are already local to that market.\n") if region != "default" else ""
 
     return f"""== SALARY (think, don't just copy) ==
-${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
+{region_line}{_fmt_money(floor, currency)} is the FLOOR for this market. Never go below it. But don't always use it either.
+
+ABSOLUTE RULE: never type a number below the FLOOR into any salary field, for
+any reason. Not as a range minimum, not as a "flexible from" value, not to look
+competitive. If a form wants a minimum AND a maximum, the minimum IS the floor.
+If the posted range sits entirely below the floor, do not lower your answer --
+enter the floor and continue.
 
 Decision tree:
-1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
-2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum $110K {currency}. Use midpoint of posted range if higher.
+1. Job posting shows a range? -> Answer with the MIDPOINT of their range, in their currency,
+   but never below the FLOOR. If their midpoint is under the floor, use the floor.
+2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum {senior_floor}. Use midpoint of posted range if higher.
 3. {convert_line}
-4. No salary info anywhere? -> Use ${floor} {currency}.
-5. Asked for a range? -> Give posted midpoint minus 10% to midpoint plus 10%. No posted range? -> "${range_min}-${range_max} {currency}".
-6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
+4. No salary info anywhere? -> Use {_fmt_money(floor, currency)}.
+5. Asked for a range? -> Give posted midpoint minus 10% to midpoint plus 10%. No posted range? -> "{_fmt_money(range_min, currency)} - {_fmt_money(range_max, currency)}".
+6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line}){monthly_line}"""
+
+
+def _relocation_line(profile: dict, city: str) -> str:
+    """Truthful relocation answer, driven by the profile."""
+    reloc = profile.get("relocation", {}) or {}
+    if reloc.get("willing_to_relocate"):
+        targets = ", ".join(reloc.get("target_locations") or []) or "the role's location"
+        return (f"currently based in {city}; WILLING TO RELOCATE to {targets}. "
+                f"Answer YES to relocation questions for those locations. "
+                f"Notice period: {reloc.get('notice_period', 'immediate')}")
+    return f"lives in {city}, cannot relocate"
+
+
+def _sponsorship_line(profile: dict) -> str:
+    """Truthful, country-dependent sponsorship answer.
+
+    A single boolean cannot express this: an Indian citizen needs no
+    sponsorship in India and does need it in the UAE. Answering "No"
+    everywhere would be a misrepresentation on a legal question.
+    """
+    wa = profile.get("work_authorization", {}) or {}
+    free = wa.get("no_sponsorship_needed_in") or wa.get("authorized_countries") or []
+    permit = wa.get("work_permit_type", "see profile")
+    if free:
+        free_list = ", ".join(free)
+        return (f"{permit}. Authorized WITHOUT sponsorship in: {free_list}. "
+                f"For a job in {free_list} -> 'authorized to work: YES', "
+                f"'require sponsorship: NO'. For a job in ANY OTHER country -> "
+                f"'require sponsorship: YES' (truthfully — do not claim otherwise). "
+                f"Never misstate work authorization or visa status.")
+    return str(wa.get("legally_authorized_to_work", "see profile"))
 
 
 def _build_screening_section(profile: dict) -> str:
@@ -173,8 +330,8 @@ def _build_screening_section(profile: dict) -> str:
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
-  - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
+  - Location/relocation: {_relocation_line(profile, city)}
+  - Work authorization: {_sponsorship_line(profile)}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
 
@@ -479,7 +636,9 @@ def build_prompt(job: dict, tailored_resume: str,
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
     location_check = _build_location_check(profile, search_config)
-    salary_section = _build_salary_section(profile)
+    # Salary band is chosen from the job's own location, not the home market.
+    job_location = " ".join(str(job.get(k, "")) for k in ("location", "title", "site", "url"))
+    salary_section = _build_salary_section(profile, job_location)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
@@ -577,6 +736,16 @@ If something unexpected happens and these instructions don't cover it, figure it
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
+8a. CONTACT EMAIL IS NOT NEGOTIABLE. The APPLICANT PROFILE email is the ONLY
+    correct address. Sites pre-fill the email tied to their account, which is
+    frequently a work address. Using it sends recruiter replies to the
+    candidate's current employer.
+    - Editable text field with a different email? -> CLEAR IT and type the profile email.
+    - Dropdown (LinkedIn Easy Apply) listing the profile email? -> SELECT IT.
+    - Dropdown that does NOT list the profile email? -> you cannot fix this in
+      the browser. STOP before submitting and output
+      RESULT:FAILED:wrong_contact_email -- do NOT submit with a work address.
+    Verify the visible email matches the profile email before every Next click.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
 9. Answer screening questions using the rules above.

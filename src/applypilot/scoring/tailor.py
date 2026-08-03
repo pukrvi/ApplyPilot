@@ -544,6 +544,25 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
 
+        # Commit this job's outcome now. Batching every write until the loop
+        # ends meant a crash, a Ctrl+C, or a quota failure part-way through
+        # discarded every resume generated so far — and left the apply queue
+        # empty even though the files existed on disk.
+        _now = datetime.now(timezone.utc).isoformat()
+        if result.get("status") in ("approved", "approved_with_judge_warning"):
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["path"], _now, result["url"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["url"],),
+            )
+        conn.commit()
+        result["_persisted"] = True
+
         elapsed = time.time() - t0
         rate = completed / elapsed if elapsed > 0 else 0
         log.info(
@@ -559,6 +578,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     now = datetime.now(timezone.utc).isoformat()
     _success_statuses = {"approved", "approved_with_judge_warning"}
     for r in results:
+        if r.get("_persisted"):
+            continue  # already committed inside the loop
         if r["status"] in _success_statuses:
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "

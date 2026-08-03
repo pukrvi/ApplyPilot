@@ -1,5 +1,11 @@
 # User data (NEVER commit)
 profile.json
+*CV*.docx
+*CV*.pdf
+*CV*.doc
+*Resume*.docx
+*Resume*.pdf
+*resume*.docx
 resume.txt
 resume.pdf
 *.env

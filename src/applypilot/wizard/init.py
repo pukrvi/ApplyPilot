@@ -188,12 +188,39 @@ def _setup_searches() -> None:
     """Generate a searches.yaml from user input."""
     console.print(Panel("[bold]Step 3: Job Search Config[/bold]\nDefine what you're looking for."))
 
-    location = Prompt.ask("Target location (e.g. 'Remote', 'Canada', 'New York, NY')", default="Remote")
-    distance_str = Prompt.ask("Search radius in miles (0 for remote-only)", default="0")
+    console.print(
+        "[dim]Each location becomes a SEPARATE search. Job boards expect one place\n"
+        "per query, so a single 'Dubai, Singapore, India' string matches nothing.[/dim]\n"
+    )
+
+    remote_anywhere = Confirm.ask(
+        "Are you open to fully remote roles from anywhere?", default=True
+    )
+
+    countries_raw = Prompt.ask(
+        "Countries or cities you'd take a job in, comma-separated\n"
+        "  (e.g. 'India, Dubai, Singapore' — leave blank for remote-only)",
+        default="",
+    )
+    places = [c.strip() for c in countries_raw.split(",") if c.strip()]
+
+    distance_str = Prompt.ask(
+        "Search radius in miles for on-site roles (0 = remote-only)", default="0"
+    )
     try:
         distance = int(distance_str)
     except ValueError:
         distance = 0
+
+    # Build the location list: remote first (widest net), then each place.
+    location_entries: list[tuple[str, bool]] = []
+    if remote_anywhere:
+        location_entries.append(("Remote", True))
+    location_entries.extend((place, False) for place in places)
+
+    if not location_entries:
+        console.print("[yellow]No locations given. Defaulting to Remote.[/yellow]")
+        location_entries = [("Remote", True)]
 
     roles_raw = Prompt.ask(
         "Target job titles (comma-separated, e.g. 'Backend Engineer, Full Stack Developer')"
@@ -204,29 +231,42 @@ def _setup_searches() -> None:
         console.print("[yellow]No roles provided. Using a default set.[/yellow]")
         roles = ["Software Engineer"]
 
+    default_location = location_entries[0][0]
+
     # Build YAML content
     lines = [
         "# ApplyPilot search configuration",
         "# Edit this file to refine your job search queries.",
+        "#",
+        "# Every query runs against every location, so the crawl is",
+        "# len(queries) x len(locations) searches. Narrow a single run with:",
+        "#   applypilot run discover --location Dubai",
         "",
         "defaults:",
-        f'  location: "{location}"',
+        f'  location: "{default_location}"',
         f"  distance: {distance}",
-        "  hours_old: 72",
+        "  hours_old: 168",
         "  results_per_site: 50",
         "",
         "locations:",
-        f'  - location: "{location}"',
-        f"    remote: {str(distance == 0).lower()}",
-        "",
-        "queries:",
     ]
+    for place, is_remote in location_entries:
+        # `label` is what --location matches against.
+        lines.append(f'  - label: "{place}"')
+        lines.append(f'    location: "{place}"')
+        lines.append(f"    remote: {str(is_remote).lower()}")
+
+    lines += ["", "queries:"]
     for i, role in enumerate(roles):
         lines.append(f'  - query: "{role}"')
         lines.append(f"    tier: {min(i + 1, 3)}")
 
     SEARCH_CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
     console.print(f"[green]Search config saved to {SEARCH_CONFIG_PATH}[/green]")
+    console.print(
+        f"[dim]{len(roles)} queries x {len(location_entries)} locations = "
+        f"{len(roles) * len(location_entries)} searches per full crawl.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -254,25 +294,44 @@ def _setup_ai_features() -> None:
 
     env_lines = ["# ApplyPilot configuration", ""]
 
+    from applypilot import keyexpiry
+
+    # (var, value) for whichever secret was entered, so we can start its clock.
+    stamped: tuple[str, str] | None = None
+
     if provider == "gemini":
-        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
+        # password=True keeps the key out of the terminal scrollback.
+        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)", password=True)
         model = Prompt.ask("Model", default="gemini-2.0-flash")
         env_lines.append(f"GEMINI_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
+        stamped = ("GEMINI_API_KEY", api_key)
     elif provider == "openai":
-        api_key = Prompt.ask("OpenAI API key")
+        api_key = Prompt.ask("OpenAI API key", password=True)
         model = Prompt.ask("Model", default="gpt-4o-mini")
         env_lines.append(f"OPENAI_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
+        stamped = ("OPENAI_API_KEY", api_key)
     elif provider == "local":
-        url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
+        url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:1234/v1")
         model = Prompt.ask("Model name", default="local-model")
         env_lines.append(f"LLM_URL={url}")
         env_lines.append(f"LLM_MODEL={model}")
 
     env_lines.append("")
     ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
-    console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
+    ENV_PATH.chmod(0o600)
+
+    if stamped:
+        keyexpiry.stamp(*stamped)
+        due = keyexpiry.expires_on(stamped[0])
+        console.print(
+            f"[green]AI configuration saved to {ENV_PATH}[/green]\n"
+            f"[dim]Key expires {due.isoformat()} ({keyexpiry.ttl_days()} days) "
+            f"and will be deleted automatically.[/dim]"
+        )
+    else:
+        console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +363,7 @@ def _setup_auto_apply() -> None:
     # Optional: CapSolver for CAPTCHAs
     console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
     if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
-        capsolver_key = Prompt.ask("CapSolver API key")
+        capsolver_key = Prompt.ask("CapSolver API key", password=True)
         # Append to existing .env or create
         if ENV_PATH.exists():
             existing = ENV_PATH.read_text(encoding="utf-8")
@@ -315,6 +374,9 @@ def _setup_auto_apply() -> None:
                 )
         else:
             ENV_PATH.write_text(f"# ApplyPilot configuration\nCAPSOLVER_API_KEY={capsolver_key}\n", encoding="utf-8")
+        ENV_PATH.chmod(0o600)
+        from applypilot import keyexpiry
+        keyexpiry.stamp("CAPSOLVER_API_KEY", capsolver_key)
         console.print("[green]CapSolver key saved.[/green]")
     else:
         console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env later if needed.[/dim]")

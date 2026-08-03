@@ -96,6 +96,21 @@ def sanitize_text(text: str) -> str:
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
+def _as_school_list(value) -> list[str]:
+    """Normalise preserved_school to a list of names.
+
+    Accepts a list, or a string. A single string containing commas is split:
+    "Masters Union, Panjab University" as one literal would never appear
+    verbatim in a resume, so treating it as one name guarantees a false
+    failure on every tailored resume.
+    """
+    if isinstance(value, (list, tuple)):
+        items = [str(v) for v in value]
+    else:
+        items = str(value or "").split(",")
+    return [s.strip() for s in items if s.strip()]
+
+
 def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
@@ -137,12 +152,19 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     preserved_companies = resume_facts.get("preserved_companies", [])
 
     if isinstance(data["experience"], list):
+        # Match against the WHOLE entry, not just `header`. Models legitimately
+        # split role and employer differently: some put the company in
+        # `header`, others put the role there and the company in `subtitle`.
+        # Checking only `header` rejected correct resumes.
+        entry_blobs = [
+            " ".join(
+                str(v) for v in (e.values() if isinstance(e, dict) else [e])
+                if isinstance(v, (str, int, float))
+            ).lower()
+            for e in data["experience"]
+        ]
         for company in preserved_companies:
-            has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
-                for e in data["experience"]
-            )
-            if not has_company:
+            if not any(company.lower() in blob for blob in entry_blobs):
                 errors.append(f"Company '{company}' missing from experience")
         for entry in data["experience"]:
             for b in entry.get("bullets", []):
@@ -154,12 +176,11 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
 
-    # Education: preserved school must be present (always enforced)
-    preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school:
-        edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
-            errors.append(f"Education '{preserved_school}' missing")
+    # Education: preserved school(s) must be present (always enforced)
+    edu = str(data.get("education", ""))
+    for school in _as_school_list(resume_facts.get("preserved_school", "")):
+        if school.lower() not in edu.lower():
+            errors.append(f"Education '{school}' missing")
 
     # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
@@ -230,9 +251,9 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
             warnings.append(f"Project '{project}' not found -- may have been renamed")
 
     # 5. Check school preserved
-    preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school and preserved_school.lower() not in text_lower:
-        errors.append(f"Education '{preserved_school}' missing")
+    for school in _as_school_list(resume_facts.get("preserved_school", "")):
+        if school.lower() not in text_lower:
+            errors.append(f"Education '{school}' missing")
 
     # 6. Check contact info preserved (warn, don't error -- we can inject)
     email = personal.get("email", "")

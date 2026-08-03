@@ -85,6 +85,12 @@ def run(
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    location: Optional[list[str]] = typer.Option(
+        None, "--location", "-l",
+        help="Only search these configured locations (repeatable). "
+             "Matches on label or location text, e.g. -l Dubai. "
+             "Omit to search every location in searches.yaml.",
+    ),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
     validation: str = typer.Option(
@@ -136,6 +142,7 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        locations=list(location) if location else None,
     )
 
     if result.get("errors"):
@@ -152,6 +159,8 @@ def apply(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
+    location: Optional[list[str]] = typer.Option(
+        None, "--location", help="Only apply to jobs whose location matches (repeatable), e.g. --location Dubai."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
@@ -242,11 +251,14 @@ def apply(
     console.print(f"  Dry run:  {dry_run}")
     if url:
         console.print(f"  Target:   {url}")
+    if location:
+        console.print(f"  Location: {', '.join(location)}")
     console.print()
 
     apply_main(
         limit=effective_limit,
         target_url=url,
+        locations=list(location) if location else None,
         min_score=min_score,
         headless=headless,
         model=model,
@@ -383,12 +395,15 @@ def doctor() -> None:
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
+    from applypilot import keyexpiry
     if has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
+        results.append(("LLM API key", ok_mark,
+                        f"Gemini ({model}) — {keyexpiry.status_line('GEMINI_API_KEY')}"))
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
+        results.append(("LLM API key", ok_mark,
+                        f"OpenAI ({model}) — {keyexpiry.status_line('OPENAI_API_KEY')}"))
     elif has_local:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
@@ -451,6 +466,99 @@ def doctor() -> None:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
 
     console.print()
+
+
+key_app = typer.Typer(help="Manage time-limited API keys.", no_args_is_help=True)
+app.add_typer(key_app, name="key")
+
+
+@key_app.command("status")
+def key_status() -> None:
+    """Show which keys are set and when each one expires."""
+    import os
+    from applypilot import config, keyexpiry
+
+    config.load_env()
+    console.print(f"\n[bold]API key status[/bold]  [dim](TTL: {keyexpiry.ttl_days()} days)[/dim]\n")
+
+    for var in keyexpiry.MANAGED_KEYS:
+        if not os.environ.get(var):
+            continue
+        due = keyexpiry.expires_on(var)
+        remaining = keyexpiry.days_remaining(var)
+        colour = "green"
+        if remaining is not None and remaining <= 0:
+            colour = "red"
+        elif remaining is not None and remaining <= 5:
+            colour = "yellow"
+        due_text = f" (on {due.isoformat()})" if due else ""
+        console.print(
+            f"  {var:<20} [{colour}]{keyexpiry.status_line(var)}[/{colour}]{due_text}"
+        )
+
+    if os.environ.get("LLM_URL"):
+        console.print(f"  {'LLM_URL':<20} [green]local endpoint — never expires[/green]")
+
+    if not any(os.environ.get(v) for v in keyexpiry.MANAGED_KEYS + ("LLM_URL",)):
+        console.print("  [dim]No keys configured. Run 'applypilot key set'.[/dim]")
+
+    console.print()
+
+
+@key_app.command("set")
+def key_set(
+    var: str = typer.Option("GEMINI_API_KEY", "--var", help="Which key to set."),
+) -> None:
+    """Store a key and start its expiry clock. Input is hidden."""
+    from applypilot import config, keyexpiry
+
+    if var not in keyexpiry.MANAGED_KEYS:
+        console.print(f"[red]Unknown key '{var}'.[/red] "
+                      f"Choose from: {', '.join(keyexpiry.MANAGED_KEYS)}")
+        raise typer.Exit(1)
+
+    value = typer.prompt(f"{var}", hide_input=True).strip()
+    if not value:
+        console.print("[yellow]Nothing entered — no changes made.[/yellow]")
+        raise typer.Exit(1)
+
+    config.APP_DIR.mkdir(parents=True, exist_ok=True)
+    keyexpiry.scrub_from_env_file(var, note="was replaced")
+
+    existing = config.ENV_PATH.read_text(encoding="utf-8") if config.ENV_PATH.exists() else ""
+    # scrub_from_env_file leaves a blank `VAR=` placeholder; fill it in.
+    if f"\n{var}=" in existing or existing.startswith(f"{var}="):
+        existing = existing.replace(f"{var}=\n", f"{var}={value}\n", 1)
+    else:
+        existing = (existing.rstrip("\n") + f"\n{var}={value}\n") if existing else f"{var}={value}\n"
+
+    config.ENV_PATH.write_text(existing, encoding="utf-8")
+    config.ENV_PATH.chmod(0o600)
+    keyexpiry.stamp(var, value)
+
+    due = keyexpiry.expires_on(var)
+    console.print(f"[green]{var} saved.[/green] Expires {due.isoformat()} "
+                  f"({keyexpiry.ttl_days()} days).")
+
+
+@key_app.command("expire")
+def key_expire(
+    var: str = typer.Option("GEMINI_API_KEY", "--var", help="Which key to delete."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
+) -> None:
+    """Delete a key now, without waiting for its TTL."""
+    import os
+    from applypilot import config, keyexpiry
+
+    config.load_env(enforce_expiry=False)
+    if not yes:
+        typer.confirm(f"Delete {var} from {config.ENV_PATH}?", abort=True)
+
+    removed = keyexpiry.scrub_from_env_file(var, note="was deleted manually")
+    keyexpiry.forget(var)
+    os.environ.pop(var, None)
+    console.print(f"[green]{var} deleted.[/green]" if removed
+                  else f"[yellow]{var} was not present in the .env file.[/yellow]")
 
 
 if __name__ == "__main__":
