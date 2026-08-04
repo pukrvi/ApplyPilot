@@ -23,8 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import UTC, date, datetime, timedelta
 
 from . import config
 
@@ -34,6 +33,16 @@ MANAGED_KEYS = ("GEMINI_API_KEY", "OPENAI_API_KEY", "CAPSOLVER_API_KEY", "LLM_AP
 META_PATH = config.APP_DIR / ".keymeta.json"
 
 DEFAULT_TTL_DAYS = 30
+
+
+def _today() -> date:
+    """Today's date in UTC.
+
+    _today() reads the local clock, so a key set at 23:00 in one timezone
+    could appear a day older or younger than intended. UTC keeps the TTL
+    stable regardless of where the machine is.
+    """
+    return datetime.now(UTC).date()
 
 
 def ttl_days() -> int:
@@ -74,7 +83,7 @@ def stamp(var: str, value: str, when: date | None = None) -> None:
     """Record that `var` was set today (or on `when`)."""
     meta = _read_meta()
     meta[var] = {
-        "set_at": (when or date.today()).isoformat(),
+        "set_at": (when or _today()).isoformat(),
         "fingerprint": _fingerprint(value),
     }
     _write_meta(meta)
@@ -104,7 +113,7 @@ def days_remaining(var: str) -> int | None:
     due = expires_on(var)
     if due is None:
         return None
-    return (due - date.today()).days
+    return (due - _today()).days
 
 
 def scrub_from_env_file(var: str, note: str | None = None) -> bool:
@@ -171,18 +180,18 @@ def enforce() -> list[str]:
 
         # First sighting, or the key was rotated by hand -> start the clock.
         if not entry or entry.get("fingerprint") != fingerprint:
-            meta[var] = {"set_at": date.today().isoformat(), "fingerprint": fingerprint}
+            meta[var] = {"set_at": _today().isoformat(), "fingerprint": fingerprint}
             dirty = True
             continue
 
         try:
             set_at = datetime.fromisoformat(entry["set_at"]).date()
         except (KeyError, ValueError):
-            meta[var] = {"set_at": date.today().isoformat(), "fingerprint": fingerprint}
+            meta[var] = {"set_at": _today().isoformat(), "fingerprint": fingerprint}
             dirty = True
             continue
 
-        if date.today() - set_at >= timedelta(days=ttl_days()):
+        if _today() - set_at >= timedelta(days=ttl_days()):
             scrub_from_env_file(var)
             os.environ.pop(var, None)
             meta.pop(var, None)

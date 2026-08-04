@@ -3,7 +3,7 @@
     "full_name": "YOUR_LEGAL_NAME",
     "preferred_name": "YOUR_PREFERRED_NAME",
     "email": "your.email@example.com",
-    "password": "YOUR_JOB_SITE_PASSWORD",
+    "password": "",
     "phone": "555-123-4567",
     "address": "123 Main St",
     "city": "Your City",
@@ -13,33 +13,75 @@
     "linkedin_url": "https://www.linkedin.com/in/yourprofile",
     "github_url": "https://github.com/yourusername",
     "portfolio_url": "",
-    "website_url": ""
+    "website_url": "",
+    "_password_note": "Leave blank unless you accept the risk. This is stored in plaintext and is sent to the LLM provider as part of the apply prompt. The agent falls back to other login paths when it is empty."
   },
   "work_authorization": {
-    "legally_authorized_to_work": "Yes",
-    "require_sponsorship": "No",
-    "work_permit_type": ""
+    "legally_authorized_to_work": true,
+    "authorized_countries": ["Your Country"],
+    "require_sponsorship": true,
+    "no_sponsorship_needed_in": ["Your Country"],
+    "work_permit_type": "Citizen",
+    "sponsorship_note": "Sponsorship is country-dependent. List the countries where you need NO sponsorship in no_sponsorship_needed_in; the agent answers YES truthfully for every other country. A single boolean cannot express this honestly and misstating visa status on an application is a legal question, not a tactic.",
+    "_note": "authorized_countries and no_sponsorship_needed_in are optional. Without them the agent falls back to the legally_authorized_to_work boolean."
+  },
+  "relocation": {
+    "willing_to_relocate": false,
+    "target_locations": [],
+    "home_city": "Your City",
+    "notice_period": "Immediately",
+    "_note": "Set willing_to_relocate true and list target_locations to apply to onsite roles away from home_city. Left false, the agent rejects any onsite role outside your home city as ineligible."
+  },
+  "compensation": {
+    "salary_currency": "USD",
+    "salary_expectation": "85000",
+    "salary_range_min": "80000",
+    "salary_range_max": "100000",
+    "senior_premium_pct": 15,
+    "default_region": "Remote (global)",
+    "currency_conversion_note": "NEVER convert between currencies. Each by_region band is the local market rate for this candidate's level. Use the band for the job's country as-is.",
+    "_by_region_note": "Optional. Salary does not convert across markets: the going rate for a role in Dubai is not your home figure at spot FX. Give each market its own researched band. `match` lists location substrings that select the band, checked in order, so put broad terms like 'remote' last. Set quote_monthly true for markets whose job ads ask for a monthly figure (UAE, Singapore, Hong Kong, much of Asia) — answering with the annual number there is a 12x overshoot. Omit by_region entirely to use the flat figures above.",
+    "by_region": {
+      "Your Country": {
+        "currency": "USD",
+        "expectation": "85000",
+        "min": "80000",
+        "max": "100000",
+        "monthly_min": "6667",
+        "monthly_max": "8333",
+        "quote_monthly": false,
+        "source": "how you arrived at this band",
+        "match": ["your country", "your city"]
+      },
+      "Remote (global)": {
+        "currency": "USD",
+        "expectation": "90000",
+        "min": "80000",
+        "max": "120000",
+        "quote_monthly": false,
+        "source": "global-remote roles typically sit below domestic bands",
+        "match": ["remote", "anywhere", "worldwide", "distributed"]
+      }
+    }
   },
   "availability": {
     "earliest_start_date": "Immediately",
     "available_for_full_time": "Yes",
     "available_for_contract": "No"
   },
-  "compensation": {
-    "salary_expectation": "85000",
-    "salary_currency": "USD",
-    "salary_range_min": "80000",
-    "salary_range_max": "100000",
-    "currency_conversion_note": ""
-  },
   "experience": {
     "years_of_experience_total": "3",
     "education_level": "Bachelor's Degree",
-    "current_job_title": "",
+    "current_title": "",
     "current_company": "",
-    "target_role": "software engineer"
+    "target_role": "software engineer",
+    "job_family": "Software Engineering",
+    "acceptable_job_families": ["Software Engineering", "Platform Engineering"],
+    "excluded_job_families": ["Sales", "Recruiting", "Customer Support"],
+    "job_family_note": "Passed to the scorer verbatim. Job boards return adjacent-function roles for your queries because the descriptions mention the same tools, and inferring your job family from resume prose alone caused mis-scoring. State it explicitly. See also title_exclude / title_keep in searches.yaml, which filters these out at discovery time before they cost an LLM call."
   },
   "skills_boundary": {
+    "_note": "The AI may only claim skills listed here. Anything absent will not appear in a tailored resume. Category names are free-form.",
     "languages": ["Python", "SQL", "JavaScript"],
     "frameworks": ["FastAPI", "Flask", "React"],
     "devops": ["Docker", "AWS", "CI/CD"],
@@ -47,9 +89,10 @@
     "tools": ["Git", "Linux"]
   },
   "resume_facts": {
+    "_note": "Preserved verbatim during tailoring. Matching is a case-insensitive substring check, so use the SHORTEST distinctive form of each name: 'Acme' passes when the AI writes 'Acme Corp Ltd', but 'Acme Corp Ltd' fails when it writes 'Acme'.",
     "preserved_companies": ["Company A", "Company B"],
     "preserved_projects": ["Project X", "Project Y"],
-    "preserved_school": "Your University",
+    "preserved_school": ["Your University", "Your Other School"],
     "real_metrics": ["50% improvement", "10x faster"]
   },
   "eeo_voluntary": {

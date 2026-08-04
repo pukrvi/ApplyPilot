@@ -25,7 +25,6 @@ def _build_profile_summary(profile: dict) -> str:
     p = profile
     personal = p["personal"]
     work_auth = p["work_authorization"]
-    comp = p["compensation"]
     exp = p.get("experience", {})
     avail = p.get("availability", {})
     eeo = p.get("eeo_voluntary", {})
@@ -326,8 +325,6 @@ def _build_screening_section(profile: dict) -> str:
     city = personal.get("city", "their city")
     years = exp.get("years_of_experience_total", "multiple")
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
-    work_auth = profile["work_authorization"]
-
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Location/relocation: {_relocation_line(profile, city)}
@@ -353,7 +350,6 @@ def _build_hard_rules(profile: dict) -> str:
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
