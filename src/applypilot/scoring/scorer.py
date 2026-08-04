@@ -50,6 +50,14 @@ HARD RULES — these override any skills overlap:
   their target job? Score 3-4.
 - Not a real job posting — a product advert, a service listing, a course, a
   recruiter's generic talent pool? Score 0.
+- A hands-on engineering or research role rather than a product role — the
+  day job is writing code, designing systems, building data pipelines, or
+  training models (Software/Data/ML/AI Engineer, Solution or Data Architect,
+  Data Scientist, DevOps/SRE, Tech Lead, Engineering Manager)? Score 1-2,
+  even when the description is full of matching tools. Owning a product that
+  USES those technologies is a different job from BUILDING them. Product
+  Manager, Product Owner, Product Marketing, and strategy/consulting roles
+  are the target family; engineering-adjacent titles are not.
 
 Seniority ladder for reference, lowest to highest:
   Intern/Graduate -> Analyst/Associate -> Manager/Senior -> Lead/Principal/
@@ -143,7 +151,14 @@ def score_job(resume_text: str, job: dict) -> dict:
             f"- Current title: {exp.get('current_title', 'unknown')}\n"
             f"- Years of experience: {exp.get('years_of_experience_total', 'unknown')}\n"
             f"- Target role: {exp.get('target_role', 'unknown')}\n"
-            f"- Education: {exp.get('education_level', 'unknown')}\n\n"
+            f"- Education: {exp.get('education_level', 'unknown')}\n"
+            + (f"- Job family: {exp['job_family']}\n" if exp.get("job_family") else "")
+            + (f"- Acceptable families: {', '.join(exp['acceptable_job_families'])}\n"
+               if exp.get("acceptable_job_families") else "")
+            + (f"- NOT acceptable: {', '.join(exp['excluded_job_families'])}\n"
+               if exp.get("excluded_job_families") else "")
+            + (f"- Note: {exp['job_family_note']}\n" if exp.get("job_family_note") else "")
+            + "\n"
         )
     except Exception:
         candidate_ctx = ""

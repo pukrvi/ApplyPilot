@@ -87,6 +87,37 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # Database operations
 # ---------------------------------------------------------------------------
 
+def _already_applied_elsewhere(conn, job: dict) -> str | None:
+    """Has an equivalent posting already been applied to?
+
+    Employers bulk-post one requisition across many city URLs (one company in
+    testing had 20 URLs for a single "Data Platform Engineer" req). The url
+    PRIMARY KEY dedupes identical URLs but cannot see these, so without this
+    check the same recruiter receives one application per URL.
+
+    Company is required for a match: titles like "Product Manager" are far too
+    generic on their own, and matching on title alone produced false positives
+    against genuinely different employers.
+
+    Returns the already-applied URL, or None.
+    """
+    company = (job.get("company") or "").strip().lower()
+    title = (job.get("title") or "").strip().lower()
+    if not company or not title:
+        return None  # cannot establish equivalence -- do not block
+
+    row = conn.execute(
+        """SELECT url FROM jobs
+           WHERE apply_status = 'applied'
+             AND LOWER(TRIM(COALESCE(company,''))) = ?
+             AND LOWER(TRIM(COALESCE(title,'')))   = ?
+             AND url <> ?
+           LIMIT 1""",
+        (company, title, job.get("url", "")),
+    ).fetchone()
+    return row["url"] if row else None
+
+
 def acquire_job(target_url: str | None = None, min_score: int = 7,
                 worker_id: int = 0, locations: list[str] | None = None) -> dict | None:
     """Atomically acquire the next job to apply to.
@@ -108,7 +139,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
@@ -135,7 +166,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 loc_clause = f"AND ({ors})"
                 params.extend(f"%{l.strip().lower()}%" for l in locations)
             row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
@@ -151,6 +182,19 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
         if not row:
             conn.rollback()
+            return None
+
+        # Skip an equivalent posting already applied to (same company+title
+        # at a different URL).
+        dup_of = _already_applied_elsewhere(conn, dict(row))
+        if dup_of:
+            conn.execute(
+                "UPDATE jobs SET apply_status = 'duplicate', "
+                "apply_error = 'same company+title already applied' WHERE url = ?",
+                (row["url"],),
+            )
+            conn.commit()
+            logger.info("Skipping duplicate of %s: %s", dup_of[:60], row["title"][:50])
             return None
 
         # Skip manual ATS sites (unsolvable CAPTCHAs)

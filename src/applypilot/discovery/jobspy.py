@@ -136,13 +136,92 @@ def _clean_str(value) -> str | None:
     return text
 
 
+# -- Title / function filtering ----------------------------------------------
+
+# Titles that are a different job family from product management. Job boards
+# return these for product queries because the descriptions mention the same
+# tools ("AI", "LLM", "roadmap"), but they are engineering/IC-technical roles.
+# Scoring them correctly returns 1-3 every time, so filtering here avoids
+# paying an LLM call per job to reach a foregone conclusion.
+#
+# Matched as whole words against the lowercased title. Override in
+# searches.yaml with `title_exclude:` / `title_exclude_extra:`.
+DEFAULT_TITLE_EXCLUDE = [
+    # hands-on engineering
+    "software engineer", "custom software engineer", "backend engineer",
+    "frontend engineer", "full stack engineer", "fullstack engineer",
+    "devops", "sre", "site reliability", "platform engineer",
+    "data platform engineer", "data engineer", "ml engineer",
+    "machine learning engineer", "ai engineer", "artificial intelligence engineer",
+    "solutions engineer", "systems engineer", "qa engineer", "test engineer",
+    "developer", "programmer", "sdet",
+    # architects
+    "architect",
+    # data science / research ICs
+    "data scientist", "research scientist", "applied scientist",
+    "research engineer",
+    # other non-product functions that surface on AI queries
+    "developer relations", "systems builder",
+    "recruiter", "talent acquisition", "sales executive",
+    "account executive", "customer support",
+]
+
+# Roles that LOOK excluded by the words above but are genuinely product /
+# strategy work. Checked first, so these always survive.
+DEFAULT_TITLE_KEEP = [
+    "product manager", "product owner", "product management",
+    "product marketing", "product lead", "product director",
+    "product strategy", "head of product", "group product manager",
+    "principal product", "product consultant",
+    "strategy", "consultant", "advisory", "transformation",
+    "enablement", "go-to-market", "gtm",
+]
+
+
+def _load_title_filters(search_cfg: dict) -> tuple[list[str], list[str]]:
+    """Return (exclude, keep) title patterns, config overriding defaults."""
+    exclude = search_cfg.get("title_exclude")
+    if exclude is None:
+        exclude = list(DEFAULT_TITLE_EXCLUDE)
+    exclude = list(exclude) + list(search_cfg.get("title_exclude_extra", []))
+
+    keep = search_cfg.get("title_keep")
+    if keep is None:
+        keep = list(DEFAULT_TITLE_KEEP)
+    keep = list(keep) + list(search_cfg.get("title_keep_extra", []))
+    return [e.lower() for e in exclude], [k.lower() for k in keep]
+
+
+def _title_ok(title: str | None, exclude: list[str], keep: list[str]) -> bool:
+    """False when the title is a different job family from the target.
+
+    `keep` wins over `exclude`, so "Technical Product Manager" survives the
+    "technical" style patterns and "Product Architect" survives "architect".
+    """
+    if not title:
+        return True  # unknown title -- keep it, let the scorer decide
+    t = title.lower()
+    if any(k in t for k in keep):
+        return True
+    return not any(x in t for x in exclude)
+
+
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
-def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
-    """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
+def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str,
+                         title_exclude: list[str] | None = None,
+                         title_keep: list[str] | None = None) -> tuple[int, int]:
+    """Store JobSpy DataFrame results into the DB. Returns (new, existing).
+
+    Rows whose title belongs to a different job family are dropped before
+    insert, so no downstream stage pays to process them.
+    """
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
+    skipped_title = 0
+    title_exclude = title_exclude if title_exclude is not None else [t.lower() for t in DEFAULT_TITLE_EXCLUDE]
+    title_keep = title_keep if title_keep is not None else [t.lower() for t in DEFAULT_TITLE_KEEP]
 
     for _, row in df.iterrows():
         url = str(row.get("job_url", ""))
@@ -150,6 +229,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             continue
 
         title = _clean_str(row.get("title"))
+        if not _title_ok(title, title_exclude, title_keep):
+            skipped_title += 1
+            continue
         company = _clean_str(row.get("company"))
         location_str = _clean_str(row.get("location"))
 
@@ -204,6 +286,8 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             existing += 1
 
     conn.commit()
+    if skipped_title:
+        log.info("Skipped %d listing(s) as wrong job family (title filter)", skipped_title)
     return new, existing
 
 
@@ -220,6 +304,8 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    title_exclude: list[str] | None = None,
+    title_keep: list[str] | None = None,
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -302,7 +388,8 @@ def _run_one_search(
     filtered = before - len(df)
 
     conn = get_connection()
-    new, existing = store_jobspy_results(conn, df, s["query"])
+    new, existing = store_jobspy_results(conn, df, s["query"],
+                                         title_exclude, title_keep)
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
@@ -425,6 +512,7 @@ def _full_crawl(
     defaults = search_cfg.get("defaults", {})
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
+    title_exclude, title_keep = _load_title_filters(search_cfg)
 
     if tiers:
         queries = [q for q in queries if q.get("tier") in tiers]
@@ -468,6 +556,7 @@ def _full_crawl(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map,
+            title_exclude, title_keep,
         )
         completed += 1
         total_new += result["new"]
