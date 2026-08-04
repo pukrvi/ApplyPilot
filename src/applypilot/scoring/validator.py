@@ -11,8 +11,8 @@ normal  -- banned words = warnings only; fabrication/structure = errors (default
 lenient -- banned words ignored; only fabrication and required structure checked
 """
 
-import re
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
@@ -78,9 +78,7 @@ def _build_skills_set(profile: dict) -> set[str]:
     boundary = profile.get("skills_boundary", {})
     allowed: set[str] = set()
     for category in boundary.values():
-        if isinstance(category, list):
-            allowed.update(s.lower().strip() for s in category)
-        elif isinstance(category, set):
+        if isinstance(category, list) or isinstance(category, set):
             allowed.update(s.lower().strip() for s in category)
     return allowed
 
@@ -100,9 +98,9 @@ def _as_school_list(value) -> list[str]:
     """Normalise preserved_school to a list of names.
 
     Accepts a list, or a string. A single string containing commas is split:
-    "Masters Union, Panjab University" as one literal would never appear
-    verbatim in a resume, so treating it as one name guarantees a false
-    failure on every tailored resume.
+    a value like "First School, Second School" would never appear verbatim
+    in a resume as one contiguous literal, so treating it as a single name
+    guarantees a false failure on every tailored resume.
     """
     if isinstance(value, (list, tuple)):
         items = [str(v) for v in value]

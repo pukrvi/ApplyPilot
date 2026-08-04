@@ -275,7 +275,7 @@ class TestRegionalSalary:
         assert uae["expectation"] == "240000"
 
     def test_more_specific_market_wins_over_remote(self):
-        """"Remote - Bengaluru, India" is an India role, not global-remote."""
+        """A city-qualified remote role belongs to that city's market."""
         name, _ = resolve_region(self.COMP, "Remote - Berlin, Germany")
         assert name == "Home"
 
